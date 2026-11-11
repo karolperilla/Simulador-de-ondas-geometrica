@@ -1,0 +1,4 @@
+numpy
+matplotlib
+streamlit>=1.40
+pillow
