@@ -1,0 +1,318 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+html,body{margin:0;padding:0;background:transparent;overflow:hidden;font-family:"Segoe UI",Arial,sans-serif;color:#e6f1ff}
+canvas{display:block;width:100%;border-radius:14px;border:1px solid rgba(70,130,230,.45);
+  background:radial-gradient(900px 500px at 50% 30%,#0c2756 0%,#071633 60%,#040b1d 100%);touch-action:none;cursor:crosshair}
+.bar{display:flex;gap:8px;flex-wrap:wrap;padding:8px 2px 0 2px;align-items:center}
+button{background:rgba(20,60,130,.7);border:1px solid rgba(90,150,255,.55);color:#e6f1ff;border-radius:10px;padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit}
+button:hover{background:rgba(30,90,190,.8)}
+.hint{font-size:12px;color:#9fc3f0;margin-left:auto}
+</style></head><body>
+<div id="wrap"><canvas id="c"></canvas>
+<div class="bar"><button id="bPlay">⏸ Pausar</button><button id="bReset">↺ Reiniciar tiempo</button><button id="bClear">🧹 Quitar gotas manuales</button>
+<span class="hint" id="hint"></span></div></div>
+<script>
+"use strict";
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const post = (type, extra) => window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, extra), "*");
+const setVal = v => post("streamlit:setComponentValue", {value: v, dataType: "json"});
+const setH = h => post("streamlit:setFrameHeight", {height: h});
+
+let P = {mode: "tanque", modelo: "agua", n: 2, pos: [[-4, 0], [4, 0]], tam: 0.5, frec: 0.45, amp: 1, prof: 5, nu: 0.01, vel: 1,
+         G: 9.81, C: 1.5, W0: 2.0, BETA: 0.5, fuentes: [], lam: 1, f: 0.8, rango: 8, vista: "onda"};
+const S = {t: 0, playing: true, W: 800, H: 600, DPR: 1, last: performance.now(), init: false, pos: [], drag: null,
+           sent: [], lastEmit: 0, timer: null, argPrev: "", manual: [], probe: null, N: 170, vh: 0, key: ""};
+post("streamlit:componentReady", {apiVersion: 1});
+window.addEventListener("message", e => { if (e.data && e.data.type === "streamlit:render") onRender(e.data.args || {}); });
+
+function posKey(a) { return JSON.stringify(a.map(p => [Math.round(p[0] * 10) / 10, Math.round(p[1] * 10) / 10])); }
+function onRender(a) {
+  P = Object.assign(P, a);
+  const src = P.mode === "tanque" ? P.pos.slice(0, P.n) : P.fuentes.map(f => [f[0], f[1]]);
+  const k = posKey(src);
+  if (!S.init || (!S.drag && k !== S.argPrev && !S.sent.some(o => o.k === k && performance.now() - o.t < 4000))) {
+    S.pos = src.map(p => [p[0], p[1]]); S.dirtyGeom = true;
+  }
+  if (S.pos.length !== src.length) { S.pos = src.map(p => [p[0], p[1]]); S.dirtyGeom = true; }
+  S.argPrev = k; S.init = true; S.dirtyParams = true;
+  document.getElementById("hint").textContent = P.mode === "tanque"
+    ? "Toca el agua para soltar una gota · arrastra las gotas fuente para moverlas"
+    : "Arrastra las fuentes · toca el campo para colocar una sonda y ver la diferencia de camino";
+  document.getElementById("bClear").style.display = P.mode === "tanque" ? "" : "none";
+}
+function emit(force) {
+  const go = () => {
+    S.lastEmit = performance.now(); S.timer = null;
+    const pos = S.pos.map(p => [Math.round(p[0] * 10) / 10, Math.round(p[1] * 10) / 10]);
+    S.sent.push({k: JSON.stringify(pos), t: performance.now()}); S.sent = S.sent.filter(o => performance.now() - o.t < 5000);
+    setVal({pos, n: (S.seq = (S.seq || 0) + 1)});
+  };
+  const now = performance.now();
+  if (force || now - S.lastEmit > 100) { if (S.timer) { clearTimeout(S.timer); S.timer = null; } go(); }
+  else if (!S.timer) S.timer = setTimeout(go, 100 - (now - S.lastEmit));
+}
+// ---------------------------------------------------------------- física
+function omega(k, m) {
+  k = Math.abs(k);
+  if (m === "sin") return P.C * k;
+  if (m === "agua") return Math.sqrt(P.G * k);
+  if (m === "somera") return Math.sqrt(P.G * k * Math.tanh(k * (P.prof || 5)));
+  if (m === "corte") return Math.sqrt(P.C * P.C * k * k + P.W0 * P.W0);
+  return P.BETA * k * k;
+}
+function J0(x) {
+  const ax = Math.abs(x);
+  if (ax < 8) {
+    const y = x * x;
+    return (57568490574.0 + y * (-13362590354.0 + y * (651619640.7 + y * (-11214424.18 + y * (77392.33017 + y * (-184.9052456))))))
+         / (57568490411.0 + y * (1029532985.0 + y * (9494680.718 + y * (59272.64853 + y * (267.8532712 + y)))));
+  }
+  const z = 8 / ax, y = z * z, xx = ax - 0.785398164;
+  const a1 = 1 + y * (-0.1098628627e-2 + y * (0.2734510407e-4 + y * (-0.2073370639e-5 + y * 0.2093887211e-6)));
+  const a2 = -0.1562499995e-1 + y * (0.1430488765e-3 + y * (-0.6911147651e-5 + y * (0.7621095161e-6 - y * 0.934935152e-7)));
+  return Math.sqrt(0.636619772 / ax) * (Math.cos(xx) * a1 - z * Math.sin(xx) * a2);
+}
+// ---------------------------------------------------------------- tanque
+const RW = 16, NR = 330, RMAX = 46;
+let Mtx = null, Mkey = "", kk = null, dkk = 0;
+function buildM() {
+  const key = P.tam;
+  if (key === Mkey && Mtx) return;
+  Mkey = key;
+  const kmax = Math.min(5 / P.tam, 19), nk = Math.ceil(kmax / 0.065); dkk = kmax / nk;
+  kk = new Float32Array(nk); for (let i = 0; i < nk; i++) kk[i] = (i + 0.5) * dkk;
+  Mtx = new Float32Array(NR * nk);
+  const dr = RMAX / (NR - 1), s2 = P.tam * P.tam;
+  for (let j = 0; j < NR; j++) for (let i = 0; i < nk; i++)
+    Mtx[j * nk + i] = s2 * Math.exp(-kk[i] * kk[i] * s2 / 2) * kk[i] * dkk * J0(kk[i] * j * dr);
+}
+function profile(dt, out) {
+  const nk = kk.length, c = new Float32Array(nk);
+  for (let i = 0; i < nk; i++) c[i] = Math.cos(omega(kk[i], P.modelo) * dt) * Math.exp(-P.nu * kk[i] * kk[i] * dt);
+  for (let j = 0; j < NR; j++) { let s = 0; const o = j * nk; for (let i = 0; i < nk; i++) s += Mtx[o + i] * c[i]; out[j] = s; }
+  out[NR] = out[NR - 1];
+}
+function dropList(t) {
+  const L = [], f = P.frec, amp = 0.5 * P.amp;
+  S.pos.forEach((p, si) => {
+    const last = Math.floor(t * f + 1e-9);
+    for (let i = Math.max(0, last - 7); i <= last; i++) L.push({x: p[0], y: p[1], dt: t - i / f, a: amp, si, ph: i});
+  });
+  S.manual.forEach((m, mi) => { const dt = t - m.t0; if (dt >= 0 && dt < 14) L.push({x: m.x, y: m.y, dt, a: 0.5 * P.amp, si: -1 - mi}); });
+  return L;
+}
+let psi = null, rmaps = {}, lut = null, off = null, offc = null, imgd = null;
+function ensureBuffers() {
+  const N = S.N;
+  if (!psi || psi.length !== N * N) {
+    psi = new Float32Array(N * N); off = document.createElement("canvas"); off.width = off.height = N; offc = off.getContext("2d"); imgd = offc.createImageData(N, N);
+  }
+}
+function mkLUT(stops) {
+  const L = new Uint8ClampedArray(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const v = i / 255 * (stops.length - 1), a = Math.min(stops.length - 2, Math.floor(v)), f = v - a;
+    for (let c = 0; c < 3; c++) L[i * 3 + c] = stops[a][c] * (1 - f) + stops[a + 1][c] * f;
+  }
+  return L;
+}
+const LUT_AGUA = mkLUT([[4, 22, 60], [12, 70, 140], [26, 140, 210], [150, 235, 255], [255, 255, 255]]);
+const LUT_DIV = mkLUT([[40, 110, 255], [14, 60, 160], [6, 20, 46], [150, 80, 30], [255, 190, 80]]);
+const LUT_INT = mkLUT([[4, 8, 30], [60, 20, 110], [200, 60, 90], [255, 170, 50], [255, 250, 220]]);
+function rmapFor(x, y, rango, N) {
+  const key = [x.toFixed(2), y.toFixed(2), rango, N].join("|");
+  if (rmaps[key]) return rmaps[key];
+  const m = new Float32Array(N * N), step = 2 * rango / N;
+  for (let j = 0; j < N; j++) for (let i = 0; i < N; i++) {
+    const gx = -rango + (i + 0.5) * step, gy = rango - (j + 0.5) * step; m[j * N + i] = Math.hypot(gx - x, gy - y);
+  }
+  if (Object.keys(rmaps).length > 40) rmaps = {};
+  return (rmaps[key] = m);
+}
+function computeTank(t) {
+  const N = S.N, step = 2 * RW / N, dr = RMAX / (NR - 1), pr = new Float32Array(NR + 1);
+  buildM(); ensureBuffers(); psi.fill(0);
+  const L = dropList(t), byDt = new Map();
+  for (const d of L) {
+    profile(d.dt, pr);
+    const rm = rmapFor(d.x, d.y, RW, N);
+    for (let p = 0; p < N * N; p++) {
+      const idx = rm[p] / dr, i0 = idx | 0, f = idx - i0;
+      psi[p] += d.a * (pr[i0] * (1 - f) + pr[i0 + 1] * f);
+    }
+  }
+  return L;
+}
+function sampleLine(t, L, n, fn) {   // ψ(x, 0) para el corte
+  const dr = RMAX / (NR - 1), out = new Float32Array(n), pr = new Float32Array(NR + 1);
+  for (const d of L) {
+    profile(d.dt, pr);
+    for (let i = 0; i < n; i++) {
+      const x = -RW + 2 * RW * i / (n - 1), idx = Math.hypot(x - d.x, d.y) / dr, i0 = idx | 0, f = idx - i0;
+      out[i] += d.a * (pr[i0] * (1 - f) + pr[i0 + 1] * f);
+    }
+  }
+  return out;
+}
+// ---------------------------------------------------------------- interferencia
+let E = null, Ekey = "", lim = 1;
+function computeInterf(t) {
+  const N = S.N, R = P.rango, k = 2 * Math.PI / P.lam, w = 2 * Math.PI * P.f; ensureBuffers();
+  const F = P.fuentes.map((f, i) => ({x: S.pos[i] ? S.pos[i][0] : f[0], y: S.pos[i] ? S.pos[i][1] : f[1], a: f[2], ph: f[3]}));
+  const maps = F.map(f => rmapFor(f.x, f.y, R, N));
+  const key = JSON.stringify([F, P.lam, R, N]);
+  if (key !== Ekey || !E) {                 // envolvente |Σ A e^{i(kr+φ)}/√r| (no depende de t)
+    Ekey = key; E = new Float32Array(N * N);
+    for (let p = 0; p < N * N; p++) {
+      let re = 0, im = 0;
+      F.forEach((f, i) => { const r = maps[i][p] + 1e-6, a = f.a / Math.sqrt(r); re += a * Math.cos(k * r + f.ph); im += a * Math.sin(k * r + f.ph); });
+      E[p] = Math.hypot(re, im);
+    }
+    const srt = Float32Array.from(E).sort(); lim = Math.max(srt[Math.floor(0.985 * srt.length)], 1e-6);
+  }
+  if (P.vista === "intensidad") { for (let p = 0; p < N * N; p++) psi[p] = Math.min(1, (E[p] * E[p]) / (lim * lim)) * 2 - 1; }
+  else for (let p = 0; p < N * N; p++) {
+    let s = 0;
+    for (let i = 0; i < F.length; i++) { const r = maps[i][p] + 1e-6; s += F[i].a * Math.cos(k * r - w * t + F[i].ph) / Math.sqrt(r); }
+    psi[p] = s / lim;
+  }
+  return F;
+}
+// ---------------------------------------------------------------- dibujo
+const side = () => Math.min(S.W, 470);
+function toPx(x, y, R) { const sd = side(), x0 = (S.W - sd) / 2; return [x0 + (x + R) / (2 * R) * sd, (R - y) / (2 * R) * sd]; }
+function toWorld(px, py, R) { const sd = side(), x0 = (S.W - sd) / 2; return [(px - x0) / sd * 2 * R - R, R - py / sd * 2 * R]; }
+function paintField(lutArr, scale, offset) {
+  const N = S.N, d = imgd.data;
+  for (let p = 0, q = 0; p < N * N; p++, q += 4) {
+    let v = psi[p] / scale; v = v < -1 ? -1 : v > 1 ? 1 : v;
+    const li = Math.round((v + 1) * 127.5) * 3; d[q] = lutArr[li]; d[q + 1] = lutArr[li + 1]; d[q + 2] = lutArr[li + 2]; d[q + 3] = 255;
+  }
+  offc.putImageData(imgd, 0, 0);
+  const sd = side(), x0 = (S.W - sd) / 2;
+  ctx.imageSmoothingEnabled = true; ctx.imageSmoothingQuality = "high";
+  ctx.save(); ctx.beginPath(); ctx.roundRect(x0, 0, sd, sd, 12); ctx.clip(); ctx.drawImage(off, x0, 0, sd, sd); ctx.restore();
+  ctx.strokeStyle = "rgba(120,180,255,.7)"; ctx.lineWidth = 2; ctx.beginPath(); ctx.roundRect(x0, 0, sd, sd, 12); ctx.stroke();
+}
+function hud(lines, x, y, w) {
+  const lh = 17, h = lines.length * lh + 14;
+  ctx.fillStyle = "rgba(6,20,50,.72)"; ctx.strokeStyle = "rgba(70,130,230,.5)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, 10); ctx.fill(); ctx.stroke();
+  ctx.font = "12.5px Segoe UI, Arial"; ctx.textBaseline = "middle"; ctx.textAlign = "left";
+  lines.forEach((l, i) => { ctx.fillStyle = l.c || "#cfe3ff"; ctx.fillText(l.t, x + 10, y + 14 + i * lh); });
+}
+function drawSource(px, py, i, ring) {
+  ctx.fillStyle = "rgba(255,255,255,.95)"; ctx.strokeStyle = "#35e08a"; ctx.lineWidth = 2.5; ctx.shadowColor = "#35e08a"; ctx.shadowBlur = 10;
+  ctx.beginPath(); ctx.arc(px, py, 7, 0, 7); ctx.fill(); ctx.stroke(); ctx.shadowBlur = 0;
+  if (ring > 0) { ctx.strokeStyle = `rgba(255,255,255,${0.7 * (1 - ring)})`; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(px, py, 7 + 26 * ring, 0, 7); ctx.stroke(); }
+  ctx.fillStyle = "#0a1630"; ctx.font = "bold 10px Segoe UI"; ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText(String(i + 1), px, py + 0.5);
+}
+function drawProfile(arr, R, lm, label) {
+  const sd = side(), x0 = (S.W - sd) / 2, y0 = sd + 14, h = S.H - y0 - 8, mid = y0 + h / 2;
+  ctx.fillStyle = "rgba(6,20,50,.6)"; ctx.strokeStyle = "rgba(70,130,230,.45)"; ctx.beginPath(); ctx.roundRect(x0, y0, sd, h, 10); ctx.fill(); ctx.stroke();
+  ctx.strokeStyle = "rgba(160,190,230,.35)"; ctx.setLineDash([4, 4]); ctx.beginPath(); ctx.moveTo(x0 + 6, mid); ctx.lineTo(x0 + sd - 6, mid); ctx.stroke(); ctx.setLineDash([]);
+  ctx.save(); ctx.beginPath(); ctx.roundRect(x0 + 2, y0 + 2, sd - 4, h - 4, 8); ctx.clip();
+  ctx.strokeStyle = "#19e6c1"; ctx.lineWidth = 2; ctx.beginPath();
+  arr.forEach((v, i) => { const x = x0 + 6 + (sd - 12) * i / (arr.length - 1), y = mid - Math.max(-1, Math.min(1, v / lm)) * (h / 2 - 8); i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); });
+  ctx.stroke(); ctx.restore();
+  ctx.fillStyle = "#9fc3f0"; ctx.font = "11px Segoe UI"; ctx.textAlign = "left"; ctx.textBaseline = "top"; ctx.fillText(label, x0 + 10, y0 + 6);
+}
+function estLambda(arr, lm) {
+  const xs = [], n = arr.length, dx = 2 * RW / (n - 1);
+  for (let i = 1; i < n; i++) if (arr[i - 1] * arr[i] < 0 && Math.abs(arr[i] - arr[i - 1]) > 0.03 * lm) xs.push(-RW + (i - arr[i] / (arr[i] - arr[i - 1])) * dx);
+  if (xs.length < 4) return null;
+  const sp = []; for (let i = 1; i < xs.length; i++) sp.push(xs[i] - xs[i - 1]);
+  sp.sort((a, b) => a - b); return 2 * sp[Math.floor(sp.length / 2)];
+}
+function drawTank() {
+  const t = S.t, L = computeTank(t), lm = 0.10 * P.amp;
+  paintField(LUT_AGUA, lm);
+  const sd = side();
+  S.pos.forEach((p, i) => { const q = toPx(p[0], p[1], RW), ph = (t * P.frec) % 1; drawSource(q[0], q[1], i, ph < 0.5 ? ph * 2 : 0); });
+  S.manual.forEach(m => { const q = toPx(m.x, m.y, RW), a = t - m.t0; if (a >= 0 && a < 0.8) { ctx.strokeStyle = `rgba(255,255,255,${1 - a / 0.8})`; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(q[0], q[1], 4 + 30 * a, 0, 7); ctx.stroke(); } });
+  const prof = sampleLine(t, L, 260), lam = estLambda(prof, lm);
+  drawProfile(prof, RW, Math.max(lm, 1.15 * Math.max(...prof.map(Math.abs))), "Corte de la onda a lo largo de y = 0");
+  const k0 = 1 / P.tam, vf = omega(k0, P.modelo) / k0, vg = (omega(k0 + 1e-4, P.modelo) - omega(k0 - 1e-4, P.modelo)) / 2e-4;
+  const lines = [{t: "t = " + t.toFixed(2) + " s    (" + P.frec.toFixed(2) + " gotas/s)", c: "#35e08a"},
+                 {t: "v. fase = " + vf.toFixed(2) + " m/s   v. grupo = " + vg.toFixed(2) + " m/s"}];
+  lines.push({t: lam ? "λ medida ≈ " + lam.toFixed(2) + " m    k ≈ " + (2 * Math.PI / lam).toFixed(2) + " rad/m" : "λ medida: esperando ondas…", c: "#19e6c1"});
+  hud(lines, (S.W - sd) / 2 + 8, 8, 280);
+}
+function drawInterf() {
+  const t = S.t, R = P.rango, F = computeInterf(t);
+  paintField(P.vista === "intensidad" ? LUT_INT : LUT_DIV, 1);
+  F.forEach((f, i) => { const q = toPx(f.x, f.y, R); drawSource(q[0], q[1], i, 0); });
+  const sd = side(), x0 = (S.W - sd) / 2;
+  // sonda
+  const lines = [{t: "λ = " + P.lam.toFixed(2) + " m   f = " + P.f.toFixed(2) + " Hz   v = " + (P.lam * P.f).toFixed(2) + " m/s", c: "#35e08a"},
+                 {t: "k = " + (2 * Math.PI / P.lam).toFixed(2) + " rad/m    " + F.length + " fuente(s)"}];
+  if (S.probe) {
+    const q = toPx(S.probe[0], S.probe[1], R);
+    ctx.strokeStyle = "#ffe08a"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(q[0], q[1], 9, 0, 7); ctx.moveTo(q[0] - 14, q[1]); ctx.lineTo(q[0] + 14, q[1]); ctx.moveTo(q[0], q[1] - 14); ctx.lineTo(q[0], q[1] + 14); ctx.stroke();
+    const rs = F.map(f => Math.hypot(S.probe[0] - f.x, S.probe[1] - f.y));
+    if (F.length >= 2) {
+      const k = 2 * Math.PI / P.lam; let re = 0, im = 0;
+      F.forEach((f, i) => { const a = f.a / Math.sqrt(rs[i] + 1e-6); re += a * Math.cos(k * rs[i] + f.ph); im += a * Math.sin(k * rs[i] + f.ph); });
+      const dl = (Math.max(...rs) - Math.min(...rs)) / P.lam, rel = Math.hypot(re, im) / lim;
+      lines.push({t: "Sonda: Δr/λ (máx−mín) = " + dl.toFixed(2), c: "#ffe08a"},
+                 {t: rel > 0.8 ? "→ interferencia CONSTRUCTIVA" : rel < 0.25 ? "→ interferencia DESTRUCTIVA" : "→ interferencia parcial (amplitud " + (100 * Math.min(rel, 1)).toFixed(0) + " %)", c: rel > 0.8 ? "#19e6c1" : rel < 0.25 ? "#ff9d9d" : "#cfe3ff"});
+    }
+  }
+  hud(lines, x0 + 8, 8, 318);
+  const n = 260, arr = new Float32Array(n), k = 2 * Math.PI / P.lam, w = 2 * Math.PI * P.f;
+  for (let i = 0; i < n; i++) {
+    const x = -R + 2 * R * i / (n - 1); let s = 0;
+    for (const f of F) { const r = Math.hypot(x - f.x, 0 - f.y) + 1e-6; s += f.a * Math.cos(k * r - w * t + f.ph) / Math.sqrt(r); }
+    arr[i] = s;
+  }
+  drawProfile(arr, R, Math.max(lim, 1e-6) * 1.2, "Corte de ψ a lo largo de y = 0 (suma de las ondas)");
+}
+function frame(now) {
+  const dt = Math.min(0.05, (now - S.last) / 1000); S.last = now;
+  const W = Math.max(320, Math.floor(document.getElementById("wrap").clientWidth)), dpr = window.devicePixelRatio || 1;
+  const sd = Math.min(W, 470), H = sd + 14 + 120;
+  if (W !== S.W || H !== S.H || dpr !== S.DPR) {
+    S.W = W; S.H = H; S.DPR = dpr; cv.width = W * dpr; cv.height = H * dpr; cv.style.height = H + "px";
+    S.N = sd < 380 ? 130 : 170; psi = null; if (S.vh !== H) { S.vh = H; setH(H + 56); }
+  }
+  if (S.playing) S.t += dt * P.vel;
+  ctx.setTransform(S.DPR, 0, 0, S.DPR, 0, 0); ctx.clearRect(0, 0, S.W, S.H);
+  if (S.init) { if (P.mode === "tanque") drawTank(); else drawInterf(); }
+  requestAnimationFrame(frame);
+}
+// ---------------------------------------------------------------- interacción
+function pos(e) { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) * S.W / r.width, (e.clientY - r.top) * S.H / r.height]; }
+const Rw = () => P.mode === "tanque" ? RW : P.rango;
+cv.addEventListener("pointerdown", e => {
+  const [px, py] = pos(e); cv.setPointerCapture(e.pointerId);
+  let best = -1, bd = 22;
+  S.pos.forEach((p, i) => { const q = toPx(p[0], p[1], Rw()), d = Math.hypot(q[0] - px, q[1] - py); if (d < bd) { bd = d; best = i; } });
+  S.down = {px, py, moved: false};
+  if (best >= 0) { S.drag = best; cv.style.cursor = "grabbing"; }
+});
+cv.addEventListener("pointermove", e => {
+  const [px, py] = pos(e);
+  if (S.drag !== null && S.drag !== undefined && S.drag !== false) {
+    const w = toWorld(px, py, Rw()), R = Rw() - 0.5;
+    S.pos[S.drag] = [Math.max(-R, Math.min(R, w[0])), Math.max(-R, Math.min(R, w[1]))]; S.down.moved = true; emit(false); return;
+  }
+  if (S.down && Math.hypot(px - S.down.px, py - S.down.py) > 4) S.down.moved = true;
+  let over = S.pos.some(p => { const q = toPx(p[0], p[1], Rw()); return Math.hypot(q[0] - px, q[1] - py) < 22; });
+  cv.style.cursor = over ? "grab" : "crosshair";
+});
+cv.addEventListener("pointerup", e => {
+  const [px, py] = pos(e), sd = side(), x0 = (S.W - sd) / 2;
+  if (S.drag !== null && S.drag !== undefined && S.drag !== false) { S.drag = null; emit(true); }
+  else if (S.down && !S.down.moved && px >= x0 && px <= x0 + sd && py <= sd) {
+    const w = toWorld(px, py, Rw());
+    if (P.mode === "tanque") { S.manual.push({x: w[0], y: w[1], t0: S.t}); if (S.manual.length > 6) S.manual.shift(); }
+    else S.probe = [w[0], w[1]];
+  }
+  S.down = null; S.drag = null; cv.style.cursor = "crosshair";
+});
+document.getElementById("bPlay").onclick = e => { S.playing = !S.playing; e.target.textContent = S.playing ? "⏸ Pausar" : "▶ Reanudar"; };
+document.getElementById("bReset").onclick = () => { S.t = 0; S.manual = []; };
+document.getElementById("bClear").onclick = () => { S.manual = []; };
+requestAnimationFrame(frame);
+</script></body></html>

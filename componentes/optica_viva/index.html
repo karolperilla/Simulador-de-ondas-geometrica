@@ -1,0 +1,441 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+html,body{margin:0;padding:0;background:transparent;overflow:hidden;font-family:"Segoe UI",Arial,sans-serif;color:#e6f1ff}
+#wrap{width:100%}
+canvas{display:block;width:100%;border-radius:14px;border:1px solid rgba(70,130,230,.45);
+  background:radial-gradient(900px 500px at 50% 40%,#0c2756 0%,#071633 60%,#040b1d 100%);touch-action:none;cursor:grab}
+.bar{display:flex;gap:8px;flex-wrap:wrap;padding:8px 2px 0 2px;align-items:center}
+button{background:rgba(20,60,130,.7);border:1px solid rgba(90,150,255,.55);color:#e6f1ff;border-radius:10px;
+  padding:7px 14px;font-size:13px;cursor:pointer;font-family:inherit}
+button:hover{background:rgba(30,90,190,.8)} button.on{background:linear-gradient(90deg,#10d9a0,#1aa0e8);border:0;font-weight:600}
+.hint{font-size:12px;color:#9fc3f0;margin-left:auto}
+</style></head><body>
+<div id="wrap"><canvas id="c"></canvas>
+<div class="bar"><button id="bPlay">⏸ Pausar</button><button id="bAuto">⟳ Auto-giro</button><button id="bReset">↺ Reiniciar</button>
+<span class="hint" id="hint"></span></div></div>
+<script>
+"use strict";
+const D2R = Math.PI / 180, R2D = 180 / Math.PI;
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const post = (type, extra) => window.parent.postMessage(Object.assign({isStreamlitMessage: true, type}, extra), "*");
+const setVal = v => post("streamlit:setComponentValue", {value: v, dataType: "json"});
+const setH = h => post("streamlit:setFrameHeight", {height: h});
+const angdiff = (a, b) => ((a - b + 540) % 360 + 360) % 360 - 180;
+const wrap360 = a => ((a % 360) + 360) % 360;
+
+let P = {mode: "prisma", alfa: 60, phi: 355, y0: 0.15, A: 1.5046, B: 0.0042, exag: 4, vel: 1, inercia: true,
+         fotones: true, reflejados: true, n1: 1, n2: 1.5, theta1: 55, lam: 600, phi_def: 355, y0_def: 0.15, th_def: 55};
+const S = {phi: 355, y0: 0.15, th: 55, t: 0, playing: true, auto: false, spin: 0, drag: null, dirty: true,
+           sent: [], lastEmit: 0, timer: null, argPrev: {}, init: false, W: 800, H: 560, s: 100, last: performance.now(), vh: 0};
+
+// ---------------------------------------------------------------- Streamlit
+post("streamlit:componentReady", {apiVersion: 1});
+window.addEventListener("message", e => {
+  if (e.data && e.data.type === "streamlit:render") onRender(e.data.args || {});
+});
+function recentlySent(v, key) { return S.sent.some(o => o.k === key && Math.abs(key === "phi" ? angdiff(o.v, v) : o.v - v) < 0.08); }
+function onRender(a) {
+  const prev = S.argPrev;
+  P = Object.assign(P, a);
+  if (!S.init) { S.phi = P.phi; S.y0 = P.y0; S.th = P.theta1; S.init = true; }
+  const busy = S.drag || Math.abs(S.spin) > 1 || S.auto;
+  if (!busy) {
+    if (prev.phi !== a.phi && !recentlySent(a.phi, "phi")) S.phiT = a.phi;
+    if (prev.y0 !== a.y0 && !recentlySent(a.y0, "y0")) S.y0 = a.y0;
+    if (prev.theta1 !== a.theta1 && !recentlySent(a.theta1, "th")) S.thT = a.theta1;
+  }
+  S.argPrev = {phi: a.phi, y0: a.y0, theta1: a.theta1};
+  document.getElementById("hint").textContent = P.mode === "prisma"
+    ? "Arrastra el prisma para girarlo 360° · arrastra el láser (izq.) para subirlo/bajarlo"
+    : "Arrastra el rayo incidente para cambiar θ₁";
+  document.getElementById("bAuto").textContent = P.mode === "prisma" ? "⟳ Auto-giro" : "↻ Barrido θ₁";
+  S.dirty = true;
+}
+function emit(force) {
+  const now = performance.now();
+  const go = () => {
+    S.lastEmit = performance.now(); S.timer = null;
+    let v;
+    if (P.mode === "prisma") {
+      v = {phi: Math.round(wrap360(S.phi) * 10) / 10, y0: Math.round(S.y0 * 1000) / 1000};
+      S.sent.push({k: "phi", v: v.phi, t: now}); S.sent.push({k: "y0", v: v.y0, t: now});
+    } else {
+      v = {theta1: Math.round(S.th * 10) / 10};
+      S.sent.push({k: "th", v: v.theta1, t: now});
+    }
+    v.n = (S.seq = (S.seq || 0) + 1);
+    S.sent = S.sent.filter(o => now - o.t < 4000);
+    setVal(v);
+  };
+  if (force || now - S.lastEmit > 90) { if (S.timer) { clearTimeout(S.timer); S.timer = null; } go(); }
+  else if (!S.timer) S.timer = setTimeout(go, 90 - (now - S.lastEmit));
+}
+
+// ---------------------------------------------------------------- óptica
+function wl2rgb(l) {
+  let r = 0, g = 0, b = 0;
+  if (l >= 380 && l < 440) { r = -(l - 440) / 60; b = 1; }
+  else if (l < 490) { g = (l - 440) / 50; b = 1; }
+  else if (l < 510) { g = 1; b = -(l - 510) / 20; }
+  else if (l < 580) { r = (l - 510) / 70; g = 1; }
+  else if (l < 645) { r = 1; g = -(l - 645) / 65; }
+  else if (l <= 780) { r = 1; }
+  let f = l < 420 ? 0.3 + 0.7 * (l - 380) / 40 : l > 700 ? 0.3 + 0.7 * (780 - l) / 80 : 1;
+  f = Math.max(f, 0.45);
+  return [Math.round(255 * Math.pow(r * f, 0.8)), Math.round(255 * Math.pow(g * f, 0.8)), Math.round(255 * Math.pow(b * f, 0.8))];
+}
+const nCauchy = l => P.A + P.B / Math.pow(l / 1000, 2);
+const nDraw = l => { const n0 = nCauchy(550); return n0 + (nCauchy(l) - n0) * P.exag; };
+function tri(alfa, phi) {
+  const a = alfa * D2R, w = Math.tan(a / 2), p = phi * D2R, c = Math.cos(p), s = Math.sin(p);
+  return [[0, 2 / 3], [-w, -1 / 3], [w, -1 / 3]].map(([x, y]) => [c * x - s * y, s * x + c * y]);
+}
+function nOut(V, i) {
+  const a = V[i], b = V[(i + 1) % 3], ex = b[0] - a[0], ey = b[1] - a[1], L = Math.hypot(ex, ey);
+  let nx = ey / L, ny = -ex / L;
+  if (nx * (a[0] + b[0]) / 2 + ny * (a[1] + b[1]) / 2 < 0) { nx = -nx; ny = -ny; }
+  return [nx, ny];
+}
+function hit(p, d, V) {
+  let best = null;
+  for (let i = 0; i < 3; i++) {
+    const a = V[i], b = V[(i + 1) % 3], ex = b[0] - a[0], ey = b[1] - a[1];
+    const den = d[0] * ey - d[1] * ex; if (Math.abs(den) < 1e-12) continue;
+    const ax = a[0] - p[0], ay = a[1] - p[1];
+    const t = (ax * ey - ay * ex) / den, u = (ax * d[1] - ay * d[0]) / den;
+    if (t > 1e-9 && u >= -1e-9 && u <= 1 + 1e-9 && (!best || t < best.t)) best = {t, i, P: [p[0] + t * d[0], p[1] + t * d[1]]};
+  }
+  return best;
+}
+function refr(d, N, n1, n2) {
+  const ci = -(d[0] * N[0] + d[1] * N[1]), eta = n1 / n2, k = 1 - eta * eta * (1 - ci * ci);
+  if (k < 0) return null;
+  const f = eta * ci - Math.sqrt(k);
+  return [eta * d[0] + f * N[0], eta * d[1] + f * N[1]];
+}
+function fres(n1, n2, ci, ct) {
+  const rs = (n1 * ci - n2 * ct) / (n1 * ci + n2 * ct), rp = (n2 * ci - n1 * ct) / (n2 * ci + n1 * ct);
+  return (rs * rs + rp * rp) / 2;
+}
+// Rayo principal (igual que optica.trazar_prisma_rot de Python)
+function devMain(n, alfa, phi, y0) {
+  const V = tri(alfa, phi), d0 = [1, 0], g = hit([-6, y0], d0, V);
+  if (!g) return {golpea: false, sale: false};
+  let No = nOut(V, g.i), P0 = g.P;
+  const thInc = Math.acos(Math.max(-1, Math.min(1, -No[0]))) * R2D;
+  let d = refr(d0, No, 1, n);
+  for (let k = 0; k < 8; k++) {
+    const h = hit(P0, d, V); if (!h) break;
+    P0 = h.P; const Nj = nOut(V, h.i), d2 = refr(d, [-Nj[0], -Nj[1]], n, 1);
+    if (!d2) { const q = 2 * (d[0] * Nj[0] + d[1] * Nj[1]); d = [d[0] - q * Nj[0], d[1] - q * Nj[1]]; continue; }
+    return {golpea: true, sale: true, thInc, dev: Math.abs(angdiff(Math.atan2(d2[1], d2[0]) * R2D, 0))};
+  }
+  return {golpea: true, sale: false, thInc};
+}
+// Árbol completo de rayos con reflexiones parciales de Fresnel
+function trazar(n, V, p0, d0, xScreen, maxDepth, minI) {
+  const out = [];
+  (function go(p, d, I, inside, depth, prev, meds, Is, weak) {
+    const cur = prev.concat([p]), g = hit(p, d, V), med = inside ? n : 1;
+    if (!g) {
+      let q;
+      if (d[0] > 1e-6 && p[0] < xScreen) { const t = (xScreen - p[0]) / d[0]; q = [p[0] + d[0] * t, p[1] + d[1] * t]; out.push(fin(cur, meds, Is, q, med, I, weak, true)); }
+      else { q = [p[0] + d[0] * 14, p[1] + d[1] * 14]; out.push(fin(cur, meds, Is, q, med, I, weak, false)); }
+      return;
+    }
+    const No = nOut(V, g.i), Ni = inside ? [-No[0], -No[1]] : No;
+    const n1 = med, n2 = inside ? 1 : n;
+    const m2 = meds.concat([med]), I2 = Is.concat([I]);
+    const dt = refr(d, Ni, n1, n2);
+    let R = 1;
+    if (dt) { const ci = -(d[0] * Ni[0] + d[1] * Ni[1]), ct = -(dt[0] * Ni[0] + dt[1] * Ni[1]); R = fres(n1, n2, ci, ct); }
+    if (dt && I * (1 - R) >= minI && depth < maxDepth) go(g.P, dt, I * (1 - R), !inside, depth + 1, cur, m2, I2, weak);
+    if (I * R >= minI && depth < maxDepth) {
+      const q = 2 * (d[0] * No[0] + d[1] * No[1]);
+      go(g.P, [d[0] - q * No[0], d[1] - q * No[1]], I * R, inside, depth + 1, cur, m2, I2, weak || !!dt);
+    }
+  })(p0, d0, 1, false, 0, [], [], [], false);
+  return out;
+}
+function fin(pts, meds, Is, q, med, I, weak, toScreen) {
+  const P2 = pts.concat([q]), m = meds.concat([med]), Ii = Is.concat([I]);
+  const L = [0];
+  for (let k = 0; k < P2.length - 1; k++) L.push(L[k] + Math.hypot(P2[k + 1][0] - P2[k][0], P2[k + 1][1] - P2[k][1]) * m[k]);
+  return {pts: P2, meds: m, Is: Ii, L, I, weak, toScreen};
+}
+</script>
+<script>
+// ---------------------------------------------------------------- escena
+const LAMS = []; for (let l = 400; l <= 700; l += 25) LAMS.push(l);
+let scene = null;
+function buildScene() {
+  const xL = -S.W / 2 / S.s + 1.15, xS = S.W / 2 / S.s - 0.55;
+  if (P.mode === "prisma") {
+    const V = tri(P.alfa, S.phi), cols = [];
+    for (const l of LAMS) {
+      const n = nDraw(l);
+      cols.push({l, rgb: wl2rgb(l), chains: trazar(n, V, [xL, S.y0], [1, 0], xS, 5, 0.012)});
+    }
+    const real = LAMS.map(l => devMain(nCauchy(l), P.alfa, S.phi, S.y0));
+    const salen = real.filter(r => r.sale).map(r => r.dev);
+    const g550 = devMain(nCauchy(550), P.alfa, S.phi, S.y0);
+    const nr = nCauchy(700), nv = nCauchy(400);
+    const dmin = 2 * Math.asin(Math.min(1, nCauchy(550) * Math.sin(P.alfa * D2R / 2))) * R2D - P.alfa;
+    scene = {V, cols, real, xL, xS, thInc: g550.thInc, hit: g550.golpea,
+             dRed: real[real.length - 1].sale ? real[real.length - 1].dev : NaN,
+             dVio: real[0].sale ? real[0].dev : NaN,
+             spread: salen.length ? Math.max(...salen) - Math.min(...salen) : NaN, nr, nv, dmin, nSalen: salen.length};
+    const hh = hit([xL, S.y0], [1, 0], V);
+    scene.first = hh ? {P: hh.P, N: nOut(V, hh.i)} : null;
+  } else {
+    const n1 = P.n1, n2 = P.n2, th = S.th * D2R, d = [Math.sin(th), -Math.cos(th)];
+    const dt = refr(d, [0, 1], n1, n2);
+    let R = 1, th2 = null;
+    if (dt) { const ci = Math.cos(th), ct = -dt[1]; R = th === 0 ? Math.pow((n1 - n2) / (n1 + n2), 2) : fres(n1, n2, ci, ct); th2 = Math.atan2(Math.abs(dt[0]), -dt[1]) * R2D; }
+    const R0 = 2.15, src = [-d[0] * R0, -d[1] * R0], chains = [];
+    const mk = (pts, meds, Is) => { const L = [0]; for (let k = 0; k < pts.length - 1; k++) L.push(L[k] + Math.hypot(pts[k + 1][0] - pts[k][0], pts[k + 1][1] - pts[k][1]) * meds[k]); return {pts, meds, Is, L, I: Is[Is.length - 1], weak: false}; };
+    if (dt) chains.push(mk([src, [0, 0], [dt[0] * 2.4, dt[1] * 2.4]], [n1, n2], [1, 1 - R]));
+    chains.push(mk([src, [0, 0], [d[0] * 2.4, -d[1] * 2.4]], [n1, n1], [1, R]));
+    scene = {src, chains, R, th2, thc: n1 > n2 ? Math.asin(n2 / n1) * R2D : null, rit: !dt, d, dt};
+  }
+}
+// ---------------------------------------------------------------- dibujo
+const sprites = {};
+function sprite(rgb) {
+  const k = rgb.join(",");
+  if (sprites[k]) return sprites[k];
+  const c = document.createElement("canvas"); c.width = c.height = 32;
+  const g = c.getContext("2d"), gr = g.createRadialGradient(16, 16, 0, 16, 16, 16);
+  gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(0.25, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0.95)`);
+  gr.addColorStop(1, `rgba(${rgb[0]},${rgb[1]},${rgb[2]},0)`);
+  g.fillStyle = gr; g.fillRect(0, 0, 32, 32); return (sprites[k] = c);
+}
+const X = x => S.W / 2 + x * S.s, Y = y => S.H / 2 - y * S.s;
+function alphaOf(I, weak) { return weak ? Math.min(0.55, 0.05 + 0.9 * Math.sqrt(I)) * 0.8 : Math.min(1, 0.25 + I); }
+function drawChain(ch, rgb, wBase, aBase) {
+  for (let k = 0; k < ch.pts.length - 1; k++) {
+    const a = ch.pts[k], b = ch.pts[k + 1];
+    ctx.strokeStyle = `rgba(${rgb[0]},${rgb[1]},${rgb[2]},${aBase * alphaOf(ch.Is[k], ch.weak)})`;
+    ctx.lineWidth = wBase * (ch.weak ? 0.8 : 1);
+    ctx.beginPath(); ctx.moveTo(X(a[0]), Y(a[1])); ctx.lineTo(X(b[0]), Y(b[1])); ctx.stroke();
+  }
+}
+function drawPhotons(ch, rgb, size, gap, dist0, alphaMul) {
+  const Lt = ch.L[ch.L.length - 1];
+  const sp = sprite(rgb);
+  for (let d = dist0; d < Lt; d += gap) {
+    let k = 0; while (k < ch.L.length - 2 && ch.L[k + 1] < d) k++;
+    const f = (d - ch.L[k]) / Math.max(1e-9, ch.L[k + 1] - ch.L[k]), a = ch.pts[k], b = ch.pts[k + 1];
+    ctx.globalAlpha = Math.min(1, alphaMul * alphaOf(ch.Is[k], ch.weak));
+    ctx.drawImage(sp, X(a[0] + (b[0] - a[0]) * f) - size / 2, Y(a[1] + (b[1] - a[1]) * f) - size / 2, size, size);
+  }
+  ctx.globalAlpha = 1;
+}
+function hud(lines, x, y, w) {
+  const lh = 17, h = lines.length * lh + 14;
+  ctx.fillStyle = "rgba(6,20,50,.78)"; ctx.strokeStyle = "rgba(70,130,230,.5)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.roundRect(x, y, w, h, 10); ctx.fill(); ctx.stroke();
+  ctx.font = "12.5px Segoe UI, Arial"; ctx.textBaseline = "middle"; ctx.textAlign = "left";
+  lines.forEach((ln, i) => { ctx.fillStyle = ln.c || "#cfe3ff"; ctx.fillText(ln.t, x + 10, y + 14 + i * lh); });
+}
+const f1 = (v, d = 2) => (isFinite(v) ? v.toFixed(d) : "—");
+
+function drawPrism(dt) {
+  const sc = scene, V = sc.V, vair = 1.7 * P.vel, T = S.t;
+  // anillo de giro con graduación
+  const cx = X(0), cy = Y(0), Rr = 1.62 * S.s;
+  ctx.strokeStyle = "rgba(110,170,255,.28)"; ctx.lineWidth = 1.5; ctx.setLineDash([5, 6]);
+  ctx.beginPath(); ctx.arc(cx, cy, Rr, 0, 2 * Math.PI); ctx.stroke(); ctx.setLineDash([]);
+  ctx.font = "11px Segoe UI"; ctx.fillStyle = "rgba(150,195,255,.75)"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  for (let a = 0; a < 360; a += 30) {
+    const r1 = Rr, r2 = Rr + (a % 90 === 0 ? 9 : 5);
+    ctx.strokeStyle = "rgba(130,185,255,.55)"; ctx.beginPath();
+    ctx.moveTo(cx + r1 * Math.cos(a * D2R), cy - r1 * Math.sin(a * D2R)); ctx.lineTo(cx + r2 * Math.cos(a * D2R), cy - r2 * Math.sin(a * D2R)); ctx.stroke();
+    if (a % 90 === 0) ctx.fillText(a + "°", cx + (Rr + 22) * Math.cos(a * D2R), cy - (Rr + 22) * Math.sin(a * D2R));
+  }
+  const ap = (90 + S.phi) * D2R;                      // dirección del vértice
+  ctx.fillStyle = "#35e08a"; ctx.shadowColor = "#35e08a"; ctx.shadowBlur = 12;
+  ctx.beginPath(); ctx.arc(cx + Rr * Math.cos(ap), cy - Rr * Math.sin(ap), 6, 0, 2 * Math.PI); ctx.fill(); ctx.shadowBlur = 0;
+  // pantalla
+  const sx = X(sc.xS);
+  ctx.fillStyle = "rgba(255,255,255,.07)"; ctx.fillRect(sx, 0, 6, S.H);
+  ctx.strokeStyle = "rgba(180,210,255,.5)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, S.H); ctx.stroke();
+  ctx.fillStyle = "rgba(150,195,255,.7)"; ctx.font = "11px Segoe UI"; ctx.save(); ctx.translate(sx + 16, S.H - 52); ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = "left"; ctx.fillText("pantalla", 0, 0); ctx.restore();
+  // vidrio (relleno)
+  const g = ctx.createLinearGradient(X(-0.7), Y(0.7), X(0.7), Y(-0.4));
+  g.addColorStop(0, "rgba(160,215,255,.22)"); g.addColorStop(1, "rgba(80,140,230,.10)");
+  ctx.beginPath(); V.forEach((v, i) => i ? ctx.lineTo(X(v[0]), Y(v[1])) : ctx.moveTo(X(v[0]), Y(v[1]))); ctx.closePath();
+  ctx.fillStyle = g; ctx.fill();
+  // rayos
+  ctx.globalCompositeOperation = "lighter"; ctx.lineCap = "round";
+  const aBase = 0.34;
+  for (const c of sc.cols) for (const ch of c.chains) {
+    if (ch.weak && !P.reflejados) continue;
+    drawChain(ch, c.rgb, ch.weak ? 1.6 : 2.3, ch.weak ? 0.9 : aBase);
+  }
+  // fotones: la velocidad dentro del vidrio es c/n(λ) → los colores se separan
+  if (P.fotones) {
+    const gap = 1.35, dist0 = (T * vair) % gap;
+    for (const c of sc.cols) for (const ch of c.chains) {
+      if (ch.weak && !P.reflejados) continue;
+      drawPhotons(ch, c.rgb, ch.weak ? 12 : 17, gap, dist0, 0.95);
+    }
+  }
+  // manchas en la pantalla
+  for (const c of sc.cols) for (const ch of c.chains) if (ch.toScreen && !ch.weak) {
+    const q = ch.pts[ch.pts.length - 1]; ctx.globalAlpha = 0.85;
+    ctx.drawImage(sprite(c.rgb), sx - 11, Y(q[1]) - 11, 22, 22);
+  }
+  ctx.globalAlpha = 1; ctx.globalCompositeOperation = "source-over";
+  // contorno del prisma
+  ctx.beginPath(); V.forEach((v, i) => i ? ctx.lineTo(X(v[0]), Y(v[1])) : ctx.moveTo(X(v[0]), Y(v[1]))); ctx.closePath();
+  ctx.strokeStyle = "rgba(170,225,255,.95)"; ctx.lineWidth = 2.5; ctx.shadowColor = "#4fb4ff"; ctx.shadowBlur = 14; ctx.stroke(); ctx.shadowBlur = 0;
+  // vértice y normal en la 1.ª cara
+  ctx.fillStyle = "#35e08a"; ctx.beginPath(); ctx.arc(X(V[0][0]), Y(V[0][1]), 4, 0, 2 * Math.PI); ctx.fill();
+  if (sc.first) {
+    const p = sc.first.P, N = sc.first.N;
+    ctx.setLineDash([4, 4]); ctx.strokeStyle = "rgba(255,255,255,.6)"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(X(p[0] - N[0] * 0.5), Y(p[1] - N[1] * 0.5)); ctx.lineTo(X(p[0] + N[0] * 0.5), Y(p[1] + N[1] * 0.5)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = "#ffe08a"; ctx.font = "12px Segoe UI"; ctx.textAlign = "left";
+    ctx.fillText("θ₁ = " + f1(sc.thInc, 1) + "°", X(p[0]) - 78, Y(p[1]) - 16);
+  }
+  // láser (asa arrastrable)
+  const lx = X(sc.xL - 0.32), ly = Y(S.y0);
+  ctx.fillStyle = "#1c2e57"; ctx.strokeStyle = "#7fb7ff"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.roundRect(lx - 26, ly - 11, 38, 22, 6); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = "#fff"; ctx.shadowColor = "#fff"; ctx.shadowBlur = 12; ctx.beginPath(); ctx.arc(lx + 14, ly, 4, 0, 2 * Math.PI); ctx.fill(); ctx.shadowBlur = 0;
+  ctx.fillStyle = "#9fc3f0"; ctx.font = "10px Segoe UI"; ctx.textAlign = "center"; ctx.fillText("↕ láser", lx - 7, ly - 19);
+  // HUD en vivo
+  const L = [{t: "Giro del prisma φ = " + f1(wrap360(S.phi), 1) + "°", c: "#35e08a"},
+             {t: "Ángulo del prisma α = " + P.alfa + "°"},
+             {t: "n rojo (700 nm) = " + f1(sc.nr, 4), c: "#ff8a8a"}, {t: "n violeta (400 nm) = " + f1(sc.nv, 4), c: "#c9a0ff"}];
+  if (!sc.hit) L.push({t: "El haz no toca el prisma", c: "#ffb36b"});
+  else if (!sc.nSalen) L.push({t: "Reflexión interna total", c: "#ffb36b"});
+  else {
+    L.push({t: "δ mín (550 nm) = " + f1(sc.dmin) + "°"}, {t: "δ rojo = " + f1(sc.dRed) + "°   δ violeta = " + f1(sc.dVio) + "°"},
+           {t: "Abertura Δθ = " + f1(sc.spread) + "°", c: "#19e6c1"});
+  }
+  hud(L, 12, 12, 236);
+  // gráfica δ(λ) en vivo
+  if (S.W > 620 && sc.nSalen) {
+    const w = 236, h = 110, x0 = 12, y0 = S.H - h - 12;
+    ctx.fillStyle = "rgba(6,20,50,.78)"; ctx.strokeStyle = "rgba(70,130,230,.5)"; ctx.beginPath(); ctx.roundRect(x0, y0, w, h, 10); ctx.fill(); ctx.stroke();
+    const ds = sc.real.filter(r => r.sale).map(r => r.dev), dmn = Math.min(...ds), dmx = Math.max(...ds), rg = Math.max(dmx - dmn, 0.05);
+    ctx.fillStyle = "#7fd1ff"; ctx.font = "11px Segoe UI"; ctx.textAlign = "left"; ctx.fillText("δ(λ) real", x0 + 10, y0 + 12);
+    const pt = i => [x0 + 22 + (w - 40) * i / (LAMS.length - 1), y0 + h - 18 - (h - 44) * (sc.real[i].dev - dmn) / rg];
+    ctx.strokeStyle = "rgba(160,190,230,.7)"; ctx.beginPath(); let st = false;
+    sc.real.forEach((r, i) => { if (!r.sale) { st = false; return; } const p = pt(i); st ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]); st = true; }); ctx.stroke();
+    sc.real.forEach((r, i) => { if (!r.sale) return; const p = pt(i); ctx.fillStyle = `rgb(${wl2rgb(LAMS[i]).join(",")})`; ctx.beginPath(); ctx.arc(p[0], p[1], 3.2, 0, 7); ctx.fill(); });
+    ctx.fillStyle = "#9fc3f0"; ctx.fillText("400", x0 + 14, y0 + h - 6); ctx.fillText("700 nm", x0 + w - 48, y0 + h - 6);
+    ctx.fillText(f1(dmx) + "°", x0 + 6, y0 + 26); ctx.fillText(f1(dmn) + "°", x0 + 6, y0 + h - 26);
+  }
+}
+
+function arc(cx, cy, r, a0, a1, col, txt, ta) {
+  ctx.strokeStyle = col; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(cx, cy, r, a0, a1, a1 < a0); ctx.stroke();
+  const m = (a0 + a1) / 2; ctx.fillStyle = col; ctx.font = "12px Segoe UI"; ctx.textAlign = ta || "center";
+  ctx.fillText(txt, cx + (r + 24) * Math.cos(m), cy + (r + 24) * Math.sin(m));
+}
+function drawSnell() {
+  const sc = scene, T = S.t, vair = 1.7 * P.vel, oy = Y(0), ox = X(0);
+  const col = wl2rgb(P.lam || 600);
+  ctx.fillStyle = `rgba(90,150,240,${0.04 + 0.10 * (P.n1 - 1)})`; ctx.fillRect(0, 0, S.W, oy);
+  ctx.fillStyle = `rgba(90,150,240,${0.05 + 0.14 * (P.n2 - 1)})`; ctx.fillRect(0, oy, S.W, S.H - oy);
+  ctx.strokeStyle = "rgba(170,215,255,.8)"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(0, oy); ctx.lineTo(S.W, oy); ctx.stroke();
+  ctx.setLineDash([5, 5]); ctx.strokeStyle = "rgba(255,255,255,.55)"; ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(ox, 8); ctx.lineTo(ox, S.H - 8); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = "#cfe3ff"; ctx.font = "13px Segoe UI"; ctx.textAlign = "right";
+  ctx.fillText("n₁ = " + P.n1.toFixed(2) + "   (v = c/n₁ = " + (1 / P.n1).toFixed(2) + " c)", S.W - 14, oy - 12);
+  ctx.fillText("n₂ = " + P.n2.toFixed(2) + "   (v = c/n₂ = " + (1 / P.n2).toFixed(2) + " c)", S.W - 14, oy + 20);
+  ctx.globalCompositeOperation = "lighter"; ctx.lineCap = "round";
+  sc.chains.forEach((ch, i) => {
+    drawChain(ch, col, 3, 0.9);
+    if (P.fotones) { const gap = 1.1; drawPhotons(ch, col, 20, gap, (T * vair) % gap, 1); }
+  });
+  ctx.globalCompositeOperation = "source-over";
+  // asa del rayo incidente
+  const sx = X(sc.src[0]), sy = Y(sc.src[1]);
+  ctx.fillStyle = "#1c2e57"; ctx.strokeStyle = "#7fb7ff"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(sx, sy, 13, 0, 7); ctx.fill(); ctx.stroke();
+  ctx.fillStyle = `rgb(${col.join(",")})`; ctx.beginPath(); ctx.arc(sx, sy, 5, 0, 7); ctx.fill();
+  // arcos de ángulo
+  const th = S.th * D2R, r0 = 0.8 * S.s;
+  arc(ox, oy, r0, -Math.PI / 2, -Math.PI / 2 - th, "#ffe08a", "θ₁ " + S.th.toFixed(1) + "°");
+  arc(ox, oy, r0, -Math.PI / 2, -Math.PI / 2 + th, "#9fe8ff", "θr " + S.th.toFixed(1) + "°");
+  if (!sc.rit) arc(ox, oy, r0 * 0.85, Math.PI / 2, Math.PI / 2 - sc.th2 * D2R * (sc.dt[0] > 0 ? 1 : -1), "#19e6c1", "θ₂ " + sc.th2.toFixed(1) + "°");
+  const L = [{t: "θ₁ (incidente) = " + S.th.toFixed(1) + "°", c: "#ffe08a"}, {t: "θr (reflejado) = " + S.th.toFixed(1) + "°", c: "#9fe8ff"}];
+  if (sc.rit) L.push({t: "Reflexión interna total (100 %)", c: "#ffb36b"});
+  else L.push({t: "θ₂ (refractado) = " + sc.th2.toFixed(1) + "°", c: "#19e6c1"}, {t: "Desviación = " + Math.abs(S.th - sc.th2).toFixed(1) + "°"});
+  L.push({t: "Reflejado R = " + (100 * sc.R).toFixed(1) + " %   Transmitido T = " + (100 * (1 - sc.R)).toFixed(1) + " %"});
+  if (sc.thc !== null) L.push({t: "Ángulo crítico θc = " + sc.thc.toFixed(1) + "°"});
+  hud(L, 12, 12, 290);
+}
+function frame(now) {
+  const dt = Math.min(0.05, (now - S.last) / 1000); S.last = now;
+  const wrapW = Math.max(320, Math.floor(document.getElementById("wrap").clientWidth));
+  const H = wrapW < 560 ? 430 : 560, dpr = window.devicePixelRatio || 1;
+  if (wrapW !== S.W || H !== S.H || dpr !== S.DPR) {
+    S.W = wrapW; S.H = H; S.DPR = dpr; cv.width = wrapW * dpr; cv.height = H * dpr; cv.style.height = H + "px";
+    S.s = H / 4.7; S.dirty = true; if (S.vh !== H) { S.vh = H; setH(H + 56); }
+  }
+  if (S.playing) S.t += dt;
+  // dinámica
+  if (P.mode === "prisma") {
+    if (S.phiT !== undefined && !S.drag) {
+      const d = angdiff(S.phiT, S.phi); S.phi = Math.abs(d) < 0.05 ? S.phiT : S.phi + d * Math.min(1, dt * 14); if (S.phi === S.phiT) S.phiT = undefined; S.dirty = true;
+    }
+    if (!S.drag && Math.abs(S.spin) > 1) { S.phi += S.spin * dt; S.spin *= Math.exp(-dt * 1.6); S.dirty = true; emit(false); if (Math.abs(S.spin) <= 1) { S.spin = 0; emit(true); } }
+    if (S.auto && !S.drag) { S.phi += 22 * dt; S.dirty = true; emit(false); }
+  } else {
+    if (S.thT !== undefined && !S.drag) { const d = S.thT - S.th; S.th = Math.abs(d) < 0.05 ? S.thT : S.th + d * Math.min(1, dt * 14); if (S.th === S.thT) S.thT = undefined; S.dirty = true; }
+    if (S.auto && !S.drag) { S.sw = (S.sw || 1); S.th += S.sw * 14 * dt; if (S.th > 89.5) { S.th = 89.5; S.sw = -1; } if (S.th < 0) { S.th = 0; S.sw = 1; } S.dirty = true; emit(false); }
+  }
+  if (S.dirty) { buildScene(); S.dirty = false; }
+  ctx.setTransform(S.DPR, 0, 0, S.DPR, 0, 0); ctx.clearRect(0, 0, S.W, S.H);
+  if (scene) { if (P.mode === "prisma") drawPrism(dt); else drawSnell(); }
+  requestAnimationFrame(frame);
+}
+// ---------------------------------------------------------------- interacción
+function pos(e) { const r = cv.getBoundingClientRect(); return [(e.clientX - r.left) * S.W / r.width, (e.clientY - r.top) * S.H / r.height]; }
+cv.addEventListener("pointerdown", e => {
+  const [px, py] = pos(e); cv.setPointerCapture(e.pointerId); S.spin = 0; S.auto = false; document.getElementById("bAuto").classList.remove("on");
+  if (P.mode === "prisma") {
+    const lx = X(scene.xL - 0.32), ly = Y(S.y0);
+    if (Math.abs(px - lx) < 44 && Math.abs(py - ly) < 26) { S.drag = {t: "beam", dy: py - ly}; cv.style.cursor = "ns-resize"; }
+    else if (Math.hypot(px - X(0), py - Y(0)) < 2.15 * S.s) {
+      S.drag = {t: "rot", a0: Math.atan2(-(py - Y(0)), px - X(0)) * R2D, p0: S.phi, ta: performance.now(), pa: S.phi, v: 0}; cv.style.cursor = "grabbing";
+    }
+  } else if (py < Y(0) + 14) { S.drag = {t: "th"}; moveDrag(px, py); cv.style.cursor = "grabbing"; }
+});
+function moveDrag(px, py) {
+  const d = S.drag; if (!d) return;
+  if (d.t === "rot") {
+    const a = Math.atan2(-(py - Y(0)), px - X(0)) * R2D, nf = d.p0 + angdiff(a, d.a0), now = performance.now();
+    const dtt = Math.max(1, now - d.ta) / 1000; d.v = 0.6 * d.v + 0.4 * angdiff(nf, d.pa) / dtt; d.ta = now; d.pa = nf; S.phi = nf; S.phiT = undefined;
+  } else if (d.t === "beam") { S.y0 = Math.max(-1.0, Math.min(1.0, -(py - d.dy - S.H / 2) / S.s)); }
+  else { S.th = Math.max(0, Math.min(89.5, Math.atan2(X(0) - px, Y(0) - py) * R2D)); S.thT = undefined; }
+  S.dirty = true; emit(false);
+}
+cv.addEventListener("pointermove", e => {
+  const [px, py] = pos(e);
+  if (S.drag) { moveDrag(px, py); return; }
+  if (P.mode === "prisma") {
+    const lx = X(scene.xL - 0.32), ly = Y(S.y0);
+    cv.style.cursor = (Math.abs(px - lx) < 44 && Math.abs(py - ly) < 26) ? "ns-resize" : (Math.hypot(px - X(0), py - Y(0)) < 2.15 * S.s ? "grab" : "default");
+  } else cv.style.cursor = py < Y(0) + 14 ? "grab" : "default";
+});
+function endDrag() {
+  const d = S.drag; S.drag = null; cv.style.cursor = "grab";
+  if (d && d.t === "rot" && P.inercia && performance.now() - d.ta < 120 && Math.abs(d.v) > 25) S.spin = Math.max(-900, Math.min(900, d.v));
+  else emit(true);
+}
+cv.addEventListener("pointerup", endDrag); cv.addEventListener("pointercancel", endDrag);
+document.getElementById("bPlay").onclick = e => { S.playing = !S.playing; e.target.textContent = S.playing ? "⏸ Pausar" : "▶ Reanudar"; };
+document.getElementById("bAuto").onclick = e => { S.auto = !S.auto; S.spin = 0; e.target.classList.toggle("on", S.auto); if (!S.auto) emit(true); };
+document.getElementById("bReset").onclick = () => {
+  S.auto = false; S.spin = 0; document.getElementById("bAuto").classList.remove("on");
+  if (P.mode === "prisma") { S.phiT = P.phi_def; S.y0 = P.y0_def; } else S.thT = P.th_def;
+  S.dirty = true; setTimeout(() => { if (P.mode === "prisma") { S.phi = P.phi_def; } else S.th = P.th_def; emit(true); }, 350);
+};
+requestAnimationFrame(frame);
+</script></body></html>
